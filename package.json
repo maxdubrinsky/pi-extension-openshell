@@ -1,0 +1,49 @@
+{
+  "name": "pi-extension-openshell",
+  "version": "0.1.0",
+  "description": "Manage NVIDIA OpenShell sandboxes from the pi coding agent through the official TypeScript SDK",
+  "type": "module",
+  "license": "Apache-2.0",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "openshell",
+    "sandbox",
+    "nvidia"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/maxdubrinsky/pi-extension-openshell.git"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "@ai-openshell/sdk": "^0.1.10",
+    "yaml": "^2.8.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@types/node": "^24.0.0",
+    "typebox": "^1.0.0",
+    "typescript": "^5.9.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts"
+  },
+  "engines": {
+    "node": ">=20.3"
+  }
+}
