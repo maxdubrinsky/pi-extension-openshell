@@ -11,15 +11,24 @@
     "sandbox",
     "nvidia"
   ],
+  "homepage": "https://github.com/maxdubrinsky/pi-extension-openshell#readme",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/maxdubrinsky/pi-extension-openshell.git"
+  },
+  "bugs": {
+    "url": "https://github.com/maxdubrinsky/pi-extension-openshell/issues"
   },
   "pi": {
     "extensions": [
       "./src/index.ts"
     ]
   },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },
@@ -41,7 +50,8 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test test/*.test.ts"
+    "test": "node --test test/*.test.ts",
+    "prepublishOnly": "npm run typecheck && npm test"
   },
   "engines": {
     "node": ">=20.3"
