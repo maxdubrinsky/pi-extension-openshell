@@ -5,7 +5,6 @@
  * sandbox. Point it at a throwaway gateway, for example:
  *
  *   OPENSHELL_TEST_GATEWAY=http://127.0.0.1:28080 \
- *   OPENSHELL_TEST_IMAGE=alpine:3.20 \
  *   node --test test/live.test.ts
  */
 
@@ -54,6 +53,8 @@ function buildHarness(): Harness {
 const notifications: string[] = [];
 const ctx = {
   cwd: process.cwd(),
+  // The bash tool exposes session details through these when it spawns.
+  sessionManager: { getSessionId: () => "pi-openshell-live-test", getSessionFile: () => undefined },
   ui: {
     notify: (message: string) => notifications.push(message),
     confirm: async () => true,
@@ -96,6 +97,15 @@ test("openshell tools drive a real gateway", { skip: !gateway, timeout: 600_000 
   assert.equal(createdDetails.name, name);
   assert.equal(createdDetails.phase, "ready");
 
+  // bash is routed into the sandbox once /openshell use selects one.
+  await commands.get("openshell")!.handler(`use ${name}`, ctx);
+  const routed = await tools.get("bash")!.execute("t", { command: "echo routed-ok; pwd" }, undefined, undefined, ctx);
+  assert.match(text(routed), /routed-ok/);
+  assert.match(text(routed), /\/sandbox/);
+  await commands.get("openshell")!.handler("use local", ctx);
+  const localBash = await tools.get("bash")!.execute("t", { command: "echo local-ok" }, undefined, undefined, ctx);
+  assert.match(text(localBash), /local-ok/);
+
   const listed = await call("openshell_list", { label_selector: "app=pi-extension-openshell", show_labels: true });
   assert.equal((listed.details as { count: number }).count, 1);
   assert.match(text(listed), new RegExp(name));
@@ -122,6 +132,41 @@ test("openshell tools drive a real gateway", { skip: !gateway, timeout: 600_000 
   await writeFile(policyFile, "version: 1\nnetworkPolicies: {}\n");
   const applied = await call("openshell_policy", { action: "set", sandbox: name, policy_file: policyFile });
   assert.match(text(applied), /policy applied/);
+
+  // Egress: default deny, then a specific allowance for the curl binary.
+  const egressBefore = await call("openshell_egress", { action: "list", sandbox: name });
+  assert.match(text(egressBefore), /no network rules, all egress denied/);
+
+  const blocked = await call("openshell_exec", {
+    sandbox: name,
+    command: "/usr/bin/wget -q -O /dev/null --timeout=15 https://example.com/ && echo FETCH_OK",
+  });
+  assert.equal(blocked.isError, true);
+
+  const allowed = await call("openshell_egress", {
+    action: "allow",
+    sandbox: name,
+    rule: "web",
+    host: "example.com",
+    port: 443,
+    access: "read-only",
+    // The gateway matches the resolved executable, so busybox applets appear as /bin/busybox.
+    binaries: ["/bin/busybox"],
+  });
+  assert.match(text(allowed), /allowed example\.com:443/);
+  assert.match(text(await call("openshell_egress", { action: "list", sandbox: name })), /web .*example\.com:443/);
+
+  const permitted = await call("openshell_exec", {
+    sandbox: name,
+    command: "/usr/bin/wget -q -O /dev/null --timeout=15 https://example.com/ && echo FETCH_OK",
+  });
+  assert.match(text(permitted), /FETCH_OK/);
+
+  const decisions = await call("openshell_egress", { action: "denials", sandbox: name, tail_lines: 10, timeout_secs: 8 });
+  assert.ok((decisions.details as { scanned: number }).scanned > 0);
+
+  const denied = await call("openshell_egress", { action: "deny", sandbox: name, rule: "web", host: "example.com" });
+  assert.match(text(denied), /denied example\.com:443/);
 
   const providers = await call("openshell_providers", { action: "list", sandbox: name });
   assert.match(text(providers), /no attached providers|provider\(s\)/);

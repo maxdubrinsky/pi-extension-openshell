@@ -12,14 +12,32 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export type { Gateway };
 
+export interface SandboxSelection {
+  name: string;
+  /** Workspace the sandbox lives in; resolved at selection time. */
+  workspace?: string;
+  /** Directory commands run in inside the sandbox. */
+  workdir?: string;
+}
+
 export class Context {
   readonly clients: ClientManager;
   private overrides: SessionOverrides = {};
   private env: Env;
+  private sandboxSelection: SandboxSelection | undefined;
 
   constructor(env: Env = process.env, clients: ClientManager = new ClientManager()) {
     this.env = env;
     this.clients = clients;
+  }
+
+  /** Sandbox that built-in bash routes into, when one is selected. */
+  get selection(): SandboxSelection | undefined {
+    return this.sandboxSelection;
+  }
+
+  selectSandbox(selection: SandboxSelection | undefined): void {
+    this.sandboxSelection = selection;
   }
 
   get sessionOverrides(): SessionOverrides {

@@ -66,15 +66,59 @@ The default local gateway requires mTLS, so point `clientCert`/`clientKey` at th
 | `openshell_policy` | Read the effective policy, settings, hashes, and source; apply a policy file |
 | `openshell_providers` | List, attach, or detach providers on a sandbox |
 | `openshell_templates` | List, create, or delete workload templates |
+| `openshell_egress` | Network egress: list rules, allow or deny an endpoint, read recent allow/deny decisions |
+| `bash` (overridden) | pi's own bash tool, routed into the selected sandbox; local when nothing is selected |
 
 Policy note: static policy fields (filesystem, landlock, process) can only be set at creation. `openshell_policy set` inherits any static field its file omits from the live policy, so a file may carry only `networkPolicies` and still apply.
 
-Exec note: `openshell_exec` is the only way to run work inside the sandbox. Built-in `bash` runs on the host, outside the gateway's isolation.
+## Sandbox the agent's own shell
+
+Selecting a sandbox rewires pi's built-in `bash` to execute inside it. Rendering, truncation, and streaming stay pi's; only the execution backend changes, so the agent keeps one tool and gets the gateway's filesystem and network policy.
+
+```
+/openshell use demo-egress        # bash now runs inside the sandbox
+/openshell use local              # back to the host shell
+```
+
+Headless sessions cannot run slash commands, so set `OPENSHELL_SANDBOX=<name>` (and optionally `OPENSHELL_SANDBOX_WORKDIR`, default `/sandbox`) to start with bash already routed. The override is deliberately conservative: host environment variables are not forwarded into the sandbox.
+
+Note that `!` user-bash and any other tool that spawns a process on the host are not rerouted. Only the `bash` tool is.
+
+## Observe and manage egress
+
+Sandboxes start with default-deny networking. A blocked request surfaces inside the sandbox as a plain connection failure, so the reason has to come from the gateway:
+
+```
+openshell_egress { action: "denials", sandbox: "demo-egress" }
+  -> DENIED /bin/busybox(134) -> example.com:443 [reason:transparent_tcp_policy_denied]
+```
+
+Then grant exactly what is needed, for exactly one binary:
+
+```
+openshell_egress { action: "allow", sandbox: "demo-egress", rule: "web",
+                   host: "example.com", port: 443, access: "read-only",
+                   binaries: ["/bin/busybox"] }
+  -> policy version 2, hash 4f79dd738d40, supervisor active at 2
+```
+
+The same command then proceeds, with no restart. `action: "deny"` removes the endpoint again, and `action: "list"` shows every rule with its protocol, access preset, enforcement mode, and binaries.
+
+Two things this nails down for you:
+
+- The gateway matches the **resolved executable**. Distro applet wrappers resolve to the real binary, so on Alpine `/usr/bin/wget` must be listed as `/bin/busybox`. The deny line names the path to use.
+- Policy changes are pushed and then polled by the supervisor. The tools wait for the revision the supervisor reports as active, so a command run right after `allow` already sees the new rule.
+
+A runnable end-to-end demo lives in `scripts/demo-egress.sh`: it creates a deny-all sandbox, runs an agent whose bash is routed into it, has the agent observe the denial, allow one endpoint, and retry.
+
+Exec note: `openshell_exec` runs commands without changing the bash routing, which is handy for quick checks and for automation that should not depend on session state.
 
 ## Command
 
 ```
-/openshell                 gateway health and sandbox counts
+/openshell                 gateway health, sandbox counts, bash routing
+/openshell use <sandbox>   route built-in bash into that sandbox
+/openshell use local       route built-in bash back to this host
 /openshell config          resolved connection config, secrets redacted
 /openshell gateway <url>   use this gateway for the session
 /openshell gateway clear   back to the configured gateway
@@ -95,7 +139,12 @@ OPENSHELL_TEST_GATEWAY=http://127.0.0.1:28080 node --test test/live.test.ts
 ./scripts/dev-gateway.sh down
 ```
 
-`test/live.test.ts` drives every tool against a real gateway: create, list, exec (string, argv, failing exit code), logs, policy get and set, providers, template create and delete, stop/start, and delete-with-confirmation. The dev gateway runs the published image with TLS disabled and unauthenticated loopback access; it is for testing only.
+`test/live.test.ts` drives every tool against a real gateway: create, list, exec (string, argv, failing exit code), bash routing into and out of a sandbox, logs, policy get and set, egress deny/allow/deny with a real fetch across the boundary, providers, template create and delete, stop/start, and delete-with-confirmation. The dev gateway runs the published image with TLS disabled and unauthenticated loopback access; it is for testing only.
+
+```bash
+./scripts/dev-gateway.sh up
+./scripts/demo-egress.sh                # agent-side egress demo
+```
 
 Sandbox names are limited to 19 characters by the gateway, and image pulls happen on the compute driver, so a first create can be slow.
 
@@ -104,6 +153,8 @@ Sandbox names are limited to 19 characters by the gateway, and image pulls happe
 - The SDK ships no file-transfer RPC, so there is no upload/download tool; small payloads go through `openshell_exec`.
 - `openshell_forward` binds in this process, so forwards end when pi exits.
 - Provider credential export (`client.providers.getCredentials`) is deliberately not exposed: it returns raw secrets and needs operator mTLS.
+- Default-deny egress can make sandbox setup look broken: DNS for an unlisted host is refused before any TCP attempt, which is the deny you want to see, not an error.
+- Large exec stdout can come back with exit code 74 and `exec output could not be delivered intact` from the supervisor even when the command succeeded; treat output as authoritative and the code as unreliable in that case.
 
 ## License
 

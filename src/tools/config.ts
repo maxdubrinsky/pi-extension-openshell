@@ -1,27 +1,14 @@
 /** Policy, provider attachment, and workload template tools. */
 
-import { readFile } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
-
-import type { SandboxPolicy, SandboxWorkloadTemplate } from "@ai-openshell/sdk";
+import type { SandboxWorkloadTemplate } from "@ai-openshell/sdk";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { parse as parseYaml } from "yaml";
 
 import { describeError } from "../client.ts";
 import { workspaceScope, type Context } from "../context.ts";
 import { formatLabels, table, truncateMiddle } from "../format.ts";
+import { asPolicyShape, inheritStaticFields, loadPolicyFile, waitForActivePolicy, type PolicyInit } from "../policy.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-
-async function loadPolicyFile(path: string, cwd: string): Promise<SandboxPolicy> {
-  const full = isAbsolute(path) ? path : resolve(cwd, path);
-  const text = await readFile(full, "utf8");
-  const parsed: unknown = parseYaml(text);
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error(`policy file ${full}: expected a policy object at the top level`);
-  }
-  return parsed as SandboxPolicy;
-}
 
 function templateName(template: SandboxWorkloadTemplate): string {
   return template.metadata?.name ?? "(unnamed)";
@@ -56,23 +43,18 @@ export function registerConfigTools(pi: ExtensionAPI, context: Context): void {
           // Static policy fields must match the create-time policy, so inherit any
           // field the file omits instead of sending a policy that would remove them.
           const current = await client.sandbox.getConfig(params.sandbox, workspaceScope(workspace));
-          const live = current.policy;
-          const policy: SandboxPolicy = {
-            ...live,
-            ...update,
-            version: update.version || live?.version || 1,
-            networkPolicies: update.networkPolicies ?? live?.networkPolicies ?? {},
-            networkMiddlewares: update.networkMiddlewares ?? live?.networkMiddlewares ?? {},
-          };
-          const result = await client.sandbox.setPolicy(params.sandbox, policy, {
+          const policy = inheritStaticFields(asPolicyShape(current.policy), update);
+          const result = await client.sandbox.setPolicy(params.sandbox, policy as PolicyInit, {
             ...workspaceScope(workspace),
             wait: params.wait ?? true,
           });
+          const ref = await client.sandbox.get(params.sandbox, workspaceScope(workspace));
+          const active = await waitForActivePolicy(client, params.sandbox, ref.workspace, result.version);
           return {
             content: [
               {
                 type: "text" as const,
-                text: `policy applied to ${params.sandbox}: version ${result.version}, hash ${result.policyHash}, settings revision ${result.settingsRevision}`,
+                text: `policy applied to ${params.sandbox}: version ${result.version} (supervisor active at ${active}), hash ${result.policyHash}, settings revision ${result.settingsRevision}`,
               },
             ],
             details: { action: "set" as const, version: result.version, policyHash: result.policyHash },

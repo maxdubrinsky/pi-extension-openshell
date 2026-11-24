@@ -24,12 +24,16 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { describeError } from "./client.ts";
 import { ConfigError } from "./config.ts";
 import { Context } from "./context.ts";
+import { registerSandboxBashTool, DEFAULT_SANDBOX_WORKDIR } from "./tools/bash.ts";
 import { registerConfigTools } from "./tools/config.ts";
+import { registerEgressTools } from "./tools/egress.ts";
 import { registerExecTools } from "./tools/exec.ts";
 import { registerSandboxTools } from "./tools/sandbox.ts";
 
 const HELP = [
-  "/openshell                 gateway health and sandbox counts",
+  "/openshell                 gateway health, sandbox counts, bash routing",
+  "/openshell use <sandbox>   route built-in bash into that sandbox",
+  "/openshell use local       route built-in bash back to this host",
   "/openshell config          resolved connection config (secrets redacted)",
   "/openshell gateway <url>   use this gateway for the session",
   "/openshell gateway clear   go back to the configured gateway",
@@ -55,9 +59,20 @@ function normalizeGatewayUrl(input: string): string {
 
 export default function openshellExtension(pi: ExtensionAPI) {
   const context = new Context();
+
+  // Headless sessions cannot run /openshell, so allow starting with bash already
+  // routed into a sandbox. The sandbox must exist and be ready; failures surface
+  // on the first command instead of blocking extension load.
+  const preselect = process.env.OPENSHELL_SANDBOX?.trim();
+  if (preselect) {
+    context.selectSandbox({ name: preselect, workdir: process.env.OPENSHELL_SANDBOX_WORKDIR?.trim() || undefined });
+  }
+
+  registerSandboxBashTool(pi, context);
   registerSandboxTools(pi, context);
   registerExecTools(pi, context);
   registerConfigTools(pi, context);
+  registerEgressTools(pi, context);
 
   pi.registerCommand("openshell", {
     description: "OpenShell gateway status and session config",
@@ -74,6 +89,12 @@ export default function openshellExtension(pi: ExtensionAPI) {
 
           case "status": {
             const lines = [await context.summary(ctx.cwd)];
+            const selection = context.selection;
+            lines.push(
+              selection
+                ? `bash: sandbox ${selection.name} (workdir ${selection.workdir ?? DEFAULT_SANDBOX_WORKDIR})`
+                : "bash: local host (use /openshell use <sandbox> to sandbox it)",
+            );
             try {
               const { client } = await context.gateway(ctx.cwd);
               const health = await client.health();
@@ -116,6 +137,28 @@ export default function openshellExtension(pi: ExtensionAPI) {
             }
             context.setWorkspace(operand);
             ctx.ui.notify(`session workspace set to ${operand}`, "info");
+            return;
+          }
+
+          case "use": {
+            if (!operand || operand === "local" || operand === "off" || operand === "host") {
+              context.selectSandbox(undefined);
+              ctx.ui.notify("bash runs on this host again", "info");
+              return;
+            }
+            const [name, workdir] = operand.split(/\s+/);
+            if (!name) throw new ConfigError("usage: /openshell use <sandbox> [workdir]");
+            const { client } = await context.gateway(ctx.cwd);
+            const workspace = await context.workspace(ctx.cwd);
+            const sandbox = await client.sandbox.get(name, workspace ? { workspace } : {});
+            if (sandbox.phase !== "ready" && sandbox.phase !== "completed") {
+              throw new ConfigError(`sandbox ${name} is ${sandbox.phase}; it must be ready before bash can run inside it`);
+            }
+            context.selectSandbox({ name: sandbox.name, workspace: sandbox.workspace, workdir: workdir || undefined });
+            ctx.ui.notify(
+              `bash now runs inside ${sandbox.name} (workspace ${sandbox.workspace}, workdir ${workdir || DEFAULT_SANDBOX_WORKDIR})`,
+              "info",
+            );
             return;
           }
 
