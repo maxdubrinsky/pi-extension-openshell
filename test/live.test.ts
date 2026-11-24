@@ -11,7 +11,7 @@
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { test } from "node:test";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -120,6 +120,23 @@ test("openshell tools drive a real gateway", { skip: !gateway, timeout: 600_000 
 
   const argv = await call("openshell_exec", { sandbox: name, command: ["echo", "argv-ok"] });
   assert.match(text(argv), /argv-ok/);
+
+  // Background job: returns at once, keeps full output in log files, settles on wait.
+  const startedJob = await call("openshell_exec", {
+    sandbox: name,
+    command: "echo bg-start; sleep 1; echo bg-end; exit 4",
+    background: true,
+    notify: false,
+  });
+  const startedDetails = startedJob.details as { job: { id: string; logs: { stdout: string } } };
+  assert.equal(startedDetails.job.id.startsWith("j"), true);
+  assert.match(text(startedJob), /This session is woken when it exits/);
+  const listedJobs = await call("openshell_jobs", { action: "list" });
+  assert.match(text(listedJobs), new RegExp(startedDetails.job.id));
+  const waited = await call("openshell_jobs", { action: "wait", id: startedDetails.job.id, timeout_secs: 60 });
+  assert.match(text(waited), /exited 4/);
+  assert.match(text(waited), /bg-end/);
+  assert.equal(await readFile(startedDetails.job.logs.stdout, "utf8"), "bg-start\nbg-end\n");
 
   const logs = await call("openshell_logs", { sandbox: name, tail_lines: 5, include_events: false, timeout_secs: 5 });
   assert.ok(text(logs).length > 0);

@@ -6,7 +6,33 @@ import { Type } from "typebox";
 import { describeError } from "../client.ts";
 import { workspaceScope, type Context } from "../context.ts";
 import { formatBytes, oneLine, truncateMiddle } from "../format.ts";
+import { describeJob, JobManager, type JobSnapshot, type JobStatus } from "../jobs.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+interface ExecDetails {
+  exitCode?: number;
+  stdoutBytes: number;
+  stderrBytes: number;
+  truncated: boolean;
+  background?: boolean;
+  job?: JobSnapshot;
+}
+
+interface JobDetails {
+  jobs: JobSnapshot[];
+}
+
+function jobText({ job, stdoutTail, stderrTail }: JobStatus, note?: string): string {
+  return [
+    describeJob(job),
+    ...(note ? [note] : []),
+    "",
+    `stdout log: ${job.logs.stdout}`,
+    `stderr log: ${job.logs.stderr}`,
+    ...(stdoutTail ? ["", "stdout tail:", stdoutTail] : []),
+    ...(stderrTail ? ["", "stderr tail:", stderrTail] : []),
+  ].join("\n");
+}
 
 interface ForwardEntry {
   id: string;
@@ -23,15 +49,31 @@ const PROGRESS_MIN_BYTES = 16 * 1024;
 export function registerExecTools(pi: ExtensionAPI, context: Context): void {
   const forwards = new Map<string, ForwardEntry>();
   let nextForwardId = 1;
+  const jobs = new JobManager();
+
+  // A finished background job pulls the agent's focus back: delivered as a
+  // follow-up so it lands when the current turn has nothing left to do.
+  if (typeof pi.sendMessage === "function") {
+    jobs.setWaker((content) => {
+      pi.sendMessage(
+        { customType: "openshell-job", content, display: true },
+        { deliverAs: "followUp", triggerTurn: true },
+      );
+    });
+  }
+  pi.on("session_shutdown", async () => {
+    jobs.stopAll();
+  });
 
   pi.registerTool({
     name: "openshell_exec",
     label: "OpenShell exec",
     description:
-      "Run a command inside an OpenShell sandbox and return its exit code, stdout, and stderr. Output streams as it arrives and is truncated in the middle when large.",
-    promptSnippet: "Run a command inside an OpenShell sandbox",
+      "Run a command inside an OpenShell sandbox and return its exit code, stdout, and stderr. Output streams as it arrives and is truncated in the middle when large. Set background to start it as a job, return immediately, and get woken with the tail when it exits; the full output stays in log files that can be read while the job runs.",
+    promptSnippet: "Run a command inside an OpenShell sandbox, in the foreground or as a background job",
     promptGuidelines: [
       "Use openshell_exec to run commands inside a sandbox; built-in bash runs on the host, which is not isolated by the gateway.",
+      "Use openshell_exec { background: true } for a long task whose output you want to review as it arrives; it returns a job id at once and wakes this session when the command exits. Inspect and steer it with openshell_jobs.",
     ],
     parameters: Type.Object({
       sandbox: Type.String({ description: "Sandbox name." }),
@@ -47,6 +89,15 @@ export function registerExecTools(pi: ExtensionAPI, context: Context): void {
       max_output_chars: Type.Optional(
         Type.Integer({ minimum: 500, maximum: 200000, description: "Cap for returned stdout+stderr text (default 20000)." }),
       ),
+      background: Type.Optional(
+        Type.Boolean({
+          description:
+            "Return a job id immediately and keep running in the background; full output goes to log files and the session is woken when the command exits (default false).",
+        }),
+      ),
+      notify: Type.Optional(
+        Type.Boolean({ description: "Background jobs: wake this session when the command exits (default true)." }),
+      ),
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       try {
@@ -59,6 +110,33 @@ export function registerExecTools(pi: ExtensionAPI, context: Context): void {
         if (argv.length === 0) throw new Error("command must not be empty");
         const timeoutSecs = params.timeout_secs ?? 300;
         const maxChars = params.max_output_chars ?? 20000;
+
+        if (params.background) {
+          const job = jobs.start(client, {
+            sandbox: params.sandbox,
+            argv,
+            workspace,
+            workdir: params.workdir,
+            environment: params.environment,
+            timeoutSecs,
+            notify: params.notify !== false,
+          });
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: [
+                  `started ${job.id} in ${job.sandbox}: ${job.command}`,
+                  `stdout log: ${job.logs.stdout}`,
+                  `stderr log: ${job.logs.stderr}`,
+                  `This session is woken when it exits. Review output meanwhile with openshell_jobs { action: "status", id: "${job.id}" } or by reading the log files.`,
+                ].join("\n"),
+              },
+            ],
+            details: { exitCode: undefined, stdoutBytes: 0, stderrBytes: 0, truncated: false, background: true, job } satisfies ExecDetails,
+          };
+        }
+
         const keepBytes = maxChars * 4;
         const stdout: Buffer[] = [];
         const stderr: Buffer[] = [];
@@ -124,7 +202,7 @@ export function registerExecTools(pi: ExtensionAPI, context: Context): void {
             stdoutBytes,
             stderrBytes,
             truncated: outText.truncated || errText.truncated,
-          },
+          } satisfies ExecDetails,
         };
       } catch (error) {
         throw new Error(describeError(error));
@@ -132,6 +210,107 @@ export function registerExecTools(pi: ExtensionAPI, context: Context): void {
     },
   });
 
+  pi.registerTool({
+    name: "openshell_jobs",
+    label: "OpenShell jobs",
+    description:
+      "Inspect and steer background exec jobs started with openshell_exec { background: true }: list them, read a job's state and output tail, wait for it with progress updates, or stop it. Full output lives in per-job log files that can also be read directly.",
+    promptSnippet: "List, inspect, wait for, or stop background sandbox exec jobs",
+    promptGuidelines: [
+      "After openshell_exec { background: true }, use openshell_jobs { action: \"status\" } to review output as it arrives, or action \"wait\" to block for a bounded time while streaming progress; the session is also woken when the job exits.",
+      "Use openshell_jobs { action: \"stop\" } to abandon a background job instead of starting a second one against the same files.",
+    ],
+    parameters: Type.Object({
+      action: StringEnum(["list", "status", "wait", "stop"] as const),
+      id: Type.Optional(Type.String({ description: "Job id, or a sandbox name to match its most recent job." })),
+      timeout_secs: Type.Optional(
+        Type.Integer({ minimum: 1, maximum: 3600, description: "How long wait blocks for completion (default 30s)." }),
+      ),
+      max_output_chars: Type.Optional(
+        Type.Integer({ minimum: 500, maximum: 200000, description: "Cap for the returned stdout/stderr tail (default 4000)." }),
+      ),
+    }),
+    executionMode: "sequential",
+    async execute(_toolCallId, params, signal, onUpdate) {
+      try {
+        const maxChars = params.max_output_chars ?? 4000;
+        if (params.action === "list") {
+          const all = jobs.list();
+          const text = all.length === 0 ? "no background jobs" : all.map((job) => describeJob(job)).join("\n");
+          return {
+            content: [{ type: "text" as const, text }],
+            details: { jobs: all } satisfies JobDetails,
+          };
+        }
+
+        if (!params.id) throw new Error(`id is required for action \"${params.action}\"`);
+
+        if (params.action === "stop") {
+          const before = jobs.get(params.id);
+          if (!before) throw new Error(`no job matches ${params.id}`);
+          if (before.phase !== "running") {
+            return {
+              content: [{ type: "text" as const, text: `${describeJob(before)}\nalready finished; output is in ${before.logs.stdout}` }],
+              details: { jobs: [before] } satisfies JobDetails,
+            };
+          }
+          const job = jobs.stop(params.id);
+          return {
+            content: [{ type: "text" as const, text: `${describeJob(job)}\nstopped; output so far is in ${job.logs.stdout}` }],
+            details: { jobs: [job] } satisfies JobDetails,
+          };
+        }
+
+        if (params.action === "status") {
+          const status = jobs.status(params.id, maxChars);
+          if (!status) throw new Error(`no job matches ${params.id}`);
+          return {
+            content: [{ type: "text" as const, text: jobText(status) }],
+            details: { jobs: [status.job] } satisfies JobDetails,
+          };
+        }
+
+        const timeoutSecs = params.timeout_secs ?? 30;
+        const current = jobs.get(params.id);
+        if (!current) throw new Error(`no job matches ${params.id}`);
+        const ticker = onUpdate
+          ? setInterval(() => {
+              const snapshot = jobs.get(params.id!);
+              if (!snapshot) return;
+              onUpdate({
+                content: [
+                  {
+                    type: "text" as const,
+                    text: `waiting on ${snapshot.id}: ${formatBytes(snapshot.stdoutBytes)} stdout, ${formatBytes(snapshot.stderrBytes)} stderr, ${snapshot.phase}`,
+                  },
+                ],
+                details: { jobs: [snapshot] } satisfies JobDetails,
+              });
+            }, 1000)
+          : undefined;
+        const { status, timedOut } = await jobs.wait(params.id, timeoutSecs * 1000, signal).finally(() => {
+          if (ticker) clearInterval(ticker);
+        });
+        if (signal?.aborted) {
+          return {
+            content: [{ type: "text" as const, text: `stopped waiting on ${status.job.id}; it is still ${status.job.phase}` }],
+            details: { jobs: [status.job] } satisfies JobDetails,
+          };
+        }
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: jobText(status, timedOut ? `still running after ${timeoutSecs}s; wait again or keep working` : undefined),
+            },
+          ],
+          details: { jobs: [status.job] } satisfies JobDetails,
+        };
+      } catch (error) {
+        throw new Error(describeError(error));
+      }
+    },
+  });
   pi.registerTool({
     name: "openshell_logs",
     label: "OpenShell logs",

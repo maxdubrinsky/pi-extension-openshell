@@ -58,7 +58,8 @@ The default local gateway requires mTLS, so point `clientCert`/`clientKey` at th
 | `openshell_status` | Gateway health and version, sandbox counts by phase |
 | `openshell_list` | Sandboxes with phase, age, workspace, template, labels; label selectors and an all-workspaces admin view |
 | `openshell_create` | Create from an image or workload template, with labels, environment, providers, GPU, exposed service ports, and a create-time policy file; optionally waits for ready |
-| `openshell_exec` | Run a string (via `/bin/sh -lc`) or an exact argv, streamed, with exit code, stdout/stderr, and middle truncation for large output |
+| `openshell_exec` | Run a string (via `/bin/sh -lc`) or an exact argv, streamed, with exit code, stdout/stderr, and middle truncation for large output; `background: true` returns a job id instead |
+| `openshell_jobs` | Background exec jobs: list, read state and output tail, wait with progress, or stop |
 | `openshell_logs` | Tail gateway logs and platform events with level and source filters |
 | `openshell_lifecycle` | Stop, start, suspend, or resume, reporting the resulting phase |
 | `openshell_delete` | Delete with the typed outcome, waiting for cleanup when it is only accepted |
@@ -113,6 +114,26 @@ A runnable end-to-end demo lives in `scripts/demo-egress.sh`: it creates a deny-
 
 Exec note: `openshell_exec` runs commands without changing the bash routing, which is handy for quick checks and for automation that should not depend on session state.
 
+## Run a long task in the background
+
+A foreground exec holds the agent until the command exits. When the point is to watch the work land, start it as a job instead:
+
+```
+openshell_exec { sandbox: "writer", command: "python3 draft.py", background: true }
+  -> started j1 in writer: /bin/sh -lc python3 draft.py
+     stdout log: ~/.local/state/pi-openshell/jobs/20261124T193000123Z-j1-writer.stdout.log
+     stderr log: ~/.local/state/pi-openshell/jobs/20261124T193000123Z-j1-writer.stderr.log
+```
+
+The call returns immediately, so the agent keeps working. Two things bring it back:
+
+- **On exit**, the session is woken with a custom message holding the exit code, duration, byte counts, and the tail of both streams, plus the log paths. It is delivered as a follow-up, so it lands when the current turn has nothing left to do. Pass `notify: false` to start a job quietly.
+- **On demand**, `openshell_jobs { action: "status", id: "j1" }` returns the state and the retained tail of each stream, and `openshell_jobs { action: "wait", id: "j1", timeout_secs: 60 }` blocks for a bounded time while streaming progress. That is how a partial draft gets reviewed mid-run: wait, read the tail, decide, wait again.
+
+Full output is never truncated in a job: stdout and stderr go to separate log files, so pi's own `read` tool can page through them, or diff successive snapshots of a file the command is writing. `action: "stop"` aborts a running job; `action: "list"` shows every job in this process.
+
+Jobs are process-lifetime state, like forwards: `/reload` or a pi restart drops the job list and aborts what was running, while the log files stay on disk. Aborting the tool call that started a job does not stop the job. The wake needs a live session, so it works in the TUI and in RPC mode; a headless `pi -p` run tears its session down as soon as the run settles, and a job that finishes after that keeps writing its logs but has nothing to wake.
+
 ## Command
 
 ```
@@ -152,6 +173,7 @@ Sandbox names are limited to 19 characters by the gateway, and image pulls happe
 
 - The SDK ships no file-transfer RPC, so there is no upload/download tool; small payloads go through `openshell_exec`.
 - `openshell_forward` binds in this process, so forwards end when pi exits.
+- Background exec jobs are process-lifetime too: a reload or restart aborts them and forgets the job list, though their log files remain.
 - Provider credential export (`client.providers.getCredentials`) is deliberately not exposed: it returns raw secrets and needs operator mTLS.
 - Default-deny egress can make sandbox setup look broken: DNS for an unlisted host is refused before any TCP attempt, which is the deny you want to see, not an error.
 - Large exec stdout can come back with exit code 74 and `exec output could not be delivered intact` from the supervisor even when the command succeeded; treat output as authoritative and the code as unreliable in that case.

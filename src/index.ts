@@ -6,7 +6,9 @@
  *   openshell_status      gateway health, version, sandbox counts by phase
  *   openshell_list        sandboxes with phase, age, workspace, template, labels
  *   openshell_create      create from an image or workload template (+ policy file)
- *   openshell_exec        run a command, streamed, with exit code and output
+ *   openshell_exec        run a command, streamed, with exit code and output;
+ *                         background mode returns a job id and wakes the session on exit
+ *   openshell_jobs        list, inspect, wait for, or stop background exec jobs
  *   openshell_logs        tail gateway-side logs and platform events
  *   openshell_lifecycle   stop / start / suspend / resume
  *   openshell_delete      delete and confirm cleanup
